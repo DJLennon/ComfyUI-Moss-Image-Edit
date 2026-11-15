@@ -17,9 +17,34 @@ import nodes as comfy_nodes
 import node_helpers
 from comfy_api.latest import io
 
-from .native_edit import edit_forward
-
 EDIT_CONTRACT = "ref-prefix-only-t0__target-text-original-moss-v1"
+# ComfyUI >= 0.43.0 implements this plugin's reference layout natively (Comfy-Org/ComfyUI#17296):
+# references at r = i + 1 / f = 0, attending only to each other at t = 0, with keys/values cached once.
+NATIVE_REFERENCE_METHOD = "index_timestep_zero_text_start"
+
+
+def has_native_reference_support(diffusion_model):
+    return hasattr(diffusion_model, "preprocess_refs")
+
+
+def patch_legacy_reference_forward(model, result):
+    # ComfyUI < 0.43.0 has no native reference path; the plugin supplies its own forward.
+    from .native_edit import edit_forward
+
+    original = model.get_model_object("extra_conds")
+    def extra_conds(_self, **kwargs):
+        out = original(**kwargs)
+        refs = kwargs.get("reference_latents", [])
+        if refs:
+            out["reference_latents"] = comfy.conds.CONDList([_self.process_latent_in(ref) for ref in refs])
+        return out
+    result.add_object_patch("extra_conds", MethodType(extra_conds, model.model))
+    original_forward = model.get_model_object("diffusion_model._forward")
+    def forward(_self, x, timestep, context, transformer_options=None, **kwargs):
+        if not kwargs.get("reference_latents"):
+            return original_forward(x, timestep, context, transformer_options or {}, **kwargs)
+        return edit_forward(_self, x, timestep, context, transformer_options, **kwargs)
+    result.add_object_patch("diffusion_model._forward", MethodType(forward, model.model.diffusion_model))
 
 
 class MossEditWeights(torch.nn.Module):
@@ -126,20 +151,9 @@ class ApplyMossImageEdit(io.ComfyNode):
         applied = result.add_patches(loaded, strength)
         if len(applied) != len(loaded) or len(loaded) != len(patch.config["modules"]):
             raise ValueError("Some MOSS Edit weights could not be applied; update ComfyUI's native MOSS support.")
-        original = model.get_model_object("extra_conds")
-        def extra_conds(_self, **kwargs):
-            out = original(**kwargs)
-            refs = kwargs.get("reference_latents", [])
-            if refs:
-                out["reference_latents"] = comfy.conds.CONDList([_self.process_latent_in(ref) for ref in refs])
-            return out
-        result.add_object_patch("extra_conds", MethodType(extra_conds, model.model))
-        original_forward = model.get_model_object("diffusion_model._forward")
-        def forward(_self, x, timestep, context, transformer_options=None, **kwargs):
-            if not kwargs.get("reference_latents"):
-                return original_forward(x, timestep, context, transformer_options or {}, **kwargs)
-            return edit_forward(_self, x, timestep, context, transformer_options, **kwargs)
-        result.add_object_patch("diffusion_model._forward", MethodType(forward, model.model.diffusion_model))
+        native = has_native_reference_support(model.model.diffusion_model)
+        if not native:
+            patch_legacy_reference_forward(model, result)
         ordered_images = [image]
         for name in sorted(reference_images or {}, key=lambda name: int(name.removeprefix("reference_"))):
             if reference_images[name] is not None:
@@ -158,6 +172,8 @@ class ApplyMossImageEdit(io.ComfyNode):
                     raise ValueError("MOSS Edit 需要匹配的 FLUX.2 VAE；请检查 Load VAE。 / Select the matching FLUX.2 VAE in Load VAE.")
                 references.append(reference)
         values = {"reference_latents": references}
+        if native:
+            values["reference_latents_method"] = NATIVE_REFERENCE_METHOD
         positive = node_helpers.conditioning_set_values(positive, values)
         negative = node_helpers.conditioning_set_values(negative, values)
         return io.NodeOutput(result, positive, negative)
